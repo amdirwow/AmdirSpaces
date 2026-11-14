@@ -1,0 +1,5 @@
+<Bindings>
+    <Binding name="AMDIRSPACES_TOGGLE" header="AMDIRSPACES_HEADER">
+        AmdirSpaces_Toggle()
+    </Binding>
+</Bindings>
