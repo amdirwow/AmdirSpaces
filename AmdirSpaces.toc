@@ -2,7 +2,7 @@
 ## Title: AmdirSpaces
 ## Notes: Fixed virtual spaces for your bags (WotLK 3.3.5a)
 ## Author: Amdir
-## Version: 1.7.0
+## Version: 1.7.1
 ## SavedVariablesPerCharacter: AmdirSpacesDB, SimpleSpacesDB
 
 AmdirSpaces.lua

@@ -1,4 +1,4 @@
--- AmdirSpaces v1.7.0 — WoW WotLK 3.3.5a / Lua 5.1
+-- AmdirSpaces v1.7.1 — WoW WotLK 3.3.5a / Lua 5.1
 -- Only the visual arrangement is changed. Blizzard's real bag slots stay untouched.
 
 BINDING_HEADER_AMDIRSPACES_HEADER = "AmdirSpaces"
@@ -17,12 +17,11 @@ local cursorSrc -- where the item on the WoW cursor was picked up from
 local pendingRefresh = false
 local nextRefresh = 0
 local pendingRuleRoute = false
+local ownBagCall = false -- true while AmdirSpaces itself opens/closes Blizzard bags
 local nextRuleRoute = 0
 local ruleRetryUntil = 0
 local ruleBagCounts = {}
 local ruleDialog
-local scrollData = {}
-local currentState
 local refreshNativeBags
 local hideShades
 local spacesFocus
@@ -77,7 +76,7 @@ local function source(bag, slot, equipped)
         link = GetContainerItemLink(bag, slot)
     end
     if not link then return nil end
-    local texture, count, quality
+    local texture, count, quality, _
     if equipped then
         texture = GetInventoryItemTexture("player", slot)
         count = 1
@@ -136,14 +135,21 @@ local function scan()
                 if it and not state.used[it] and it.id == pinned.id then
                     state.used[it] = true
                     state.assignments[sp.id][pos] = it
+                    pinned.pendingUntil = nil
                 end
             end
         end
     end
+    -- A cell waiting for an item that is still travelling to its bag slot
+    -- (split stack, bank) must not grab another copy by itemID meanwhile.
+    local now = GetTime()
     for pass = 1, 2 do
         for _, sp in ipairs(db.spaces) do
             for pos, pinned in ipairs(allSlots(sp)) do
-                if pinned and not state.assignments[sp.id][pos] then
+                if pinned and pinned.pendingUntil and now >= pinned.pendingUntil then
+                    pinned.pendingUntil = nil
+                end
+                if pinned and not pinned.pendingUntil and not state.assignments[sp.id][pos] then
                     local candidate
                     for _, pool in ipairs({state.equipped, state.bags}) do
                         for _, it in ipairs(pool) do
@@ -209,24 +215,6 @@ local function materials(it)
     local reagentType = GetItemInfo and select(6, GetItemInfo(17020))
     return reagentType ~= nil and kind == reagentType
 end
-
--- WotLK has no separate "Toy" item class. Start with verified pre-Cata toy IDs.
--- Additional items can be tagged by the player via Alt + right click in AmdirSpaces.
-local KNOWN_TOYS = {
-    [1973] = true,   -- Orb of Deception
-    [13379] = true,  -- Piccolo of the Flaming Fire
-    [32782] = true,  -- Time-Lost Figurine
-    [35275] = true,  -- Orb of the Sin'dorei
-    [37254] = true,  -- Super Simian Sphere
-    [34686] = true,  -- Brazier of Dancing Flames
-    [43499] = true,  -- Iron Boot Flask
-    [18984] = true,  -- Dimensional Ripper - Everlook
-    [18660] = true,  -- World Enlarger
-    [17712] = true,  -- Winter Veil Disguise Kit
-    [34480] = true,  -- Romantic Picnic Basket
-    [38301] = true,  -- D.I.S.C.O.
-    [40768] = true,  -- MOLL-E
-}
 
 local RULES = {
     {id = "grey",    name = "Сірий шмот", match = function(it) return isGear(it) and it.quality == 0 end},
@@ -312,6 +300,7 @@ end
 local function cellFree(sp, i, state)
     local slots = allSlots(sp)
     if not slots[i] then return true end
+    if slots[i].pendingUntil and GetTime() < slots[i].pendingUntil then return false end
     return state and not (state.assignments[sp.id] or {})[i]
 end
 
@@ -359,7 +348,7 @@ end
 -- Put an item into an exact virtual cell. Works like a bag swap:
 --   * item from another virtual cell  -> the two cells exchange contents;
 --   * item from "General"             -> whatever was in the cell returns to General.
-local function pinAt(sp, pos, it)
+local function pinAt(sp, pos, it, pending)
 
     if not sp or not it or not it.id then return false end
     if not pos or pos < 1 or pos > MAX_SPACE_SLOTS then return false end
@@ -373,7 +362,8 @@ local function pinAt(sp, pos, it)
     if replaced and cellFree(sp, pos, state) then replaced = false end
     if oldSpace then oldSpace.slots[oldPos] = replaced or false end
     slots[pos] = {id = it.id, key = it.key, link = it.link, icon = it.icon,
-        bag = (not it.equipped) and it.bag or nil, slot = (not it.equipped) and it.slot or nil}
+        bag = (not it.equipped) and it.bag or nil, slot = (not it.equipped) and it.slot or nil,
+        pendingUntil = pending and (GetTime() + 3) or nil}
     return true
 end
 
@@ -416,6 +406,23 @@ local function applyRules(state, accept)
         end
     end
     return moved
+end
+
+-- Remember what is already in the bags without routing anything: rules only
+-- apply to items that arrive later (login / reload must not undo manual moves).
+local function primeRuleCounts()
+    local counts = {}
+    for bag = 0, 4 do
+        for slot = 1, (GetContainerNumSlots(bag) or 0) do
+            local link = GetContainerItemLink(bag, slot)
+            if link then
+                local _, count = GetContainerItemInfo(bag, slot)
+                local key = itemKey(link) or tostring(itemID(link))
+                counts[key] = (counts[key] or 0) + (count or 1)
+            end
+        end
+    end
+    ruleBagCounts = counts
 end
 
 local function routeIncomingItems()
@@ -513,16 +520,27 @@ local function releaseCursor()
     cursorSrc = nil
 end
 
-local function firstFreeSlot()
-    for bag = 0, 4 do
-        local family = 0
-        if bag > 0 and GetContainerNumFreeSlots then
-            local _, f = GetContainerNumFreeSlots(bag)
-            family = f or 0
-        end
-        if family == 0 then
-            for slot = 1, (GetContainerNumSlots(bag) or 0) do
-                if not GetContainerItemLink(bag, slot) then return bag, slot end
+-- Ordinary bags first; a profession bag only when it accepts this item
+-- (herbs -> herb bag), exactly where the client would allow the drop.
+local function firstFreeSlot(carried)
+    local itemFamily = 0
+    if carried and carried.id and GetItemFamily and carried.equipLoc ~= "INVTYPE_BAG" then
+        itemFamily = GetItemFamily(carried.id) or 0
+    end
+    for pass = 1, 2 do
+        for bag = 0, 4 do
+            local family = 0
+            if bag > 0 and GetContainerNumFreeSlots then
+                local _, f = GetContainerNumFreeSlots(bag)
+                family = f or 0
+            end
+            local fits
+            if pass == 1 then fits = family == 0
+            else fits = family ~= 0 and bit and bit.band(family, itemFamily) ~= 0 end
+            if fits then
+                for slot = 1, (GetContainerNumSlots(bag) or 0) do
+                    if not GetContainerItemLink(bag, slot) then return bag, slot end
+                end
             end
         end
     end
@@ -563,12 +581,12 @@ local function dropOnSpace(sp, pos, cell)
         end
         -- Empty cell: the new stack really goes into a free bag slot and
         -- this cell is reserved for exactly that slot.
-        local bag, slot = firstFreeSlot()
+        local bag, slot = firstFreeSlot(carried)
         if not bag then say("У сумках немає вільного місця."); return end
         PickupContainerItem(bag, slot)
         cursorSrc = nil
         pinAt(sp, pos, {id = carried.id, key = carried.key, link = carried.link,
-            icon = carried.icon, bag = bag, slot = slot})
+            icon = carried.icon, bag = bag, slot = slot}, true)
         repaint()
         return
     end
@@ -578,11 +596,12 @@ local function dropOnSpace(sp, pos, cell)
         pinAt(sp, pos, it)
     else
         -- Item from the bank or elsewhere: really put it into a free bag slot.
-        local bag, slot = firstFreeSlot()
+        local bag, slot = firstFreeSlot(carried)
         if not bag then say("У сумках немає вільного місця."); return end
         PickupContainerItem(bag, slot)
         cursorSrc = nil
-        pinAt(sp, pos, carried)
+        pinAt(sp, pos, {id = carried.id, key = carried.key, link = carried.link,
+            icon = carried.icon, bag = bag, slot = slot}, true)
     end
     repaint()
 end
@@ -597,7 +616,7 @@ local function dropOnGeneral(phys)
         -- Partial stack: plain bag operation (empty slot, or merge into a stack).
         local bag, slot
         if phys and phys.bag then bag, slot = phys.bag, phys.slot
-        else bag, slot = firstFreeSlot() end
+        else bag, slot = firstFreeSlot(carried) end
         if bag then PickupContainerItem(bag, slot) else releaseCursor() end
         return
     end
@@ -641,17 +660,6 @@ local function pickupCell(b)
     elseif it.bag then
         ContainerFrameItemButton_OnClick(b, "LeftButton")
     end
-end
-
-local function toggleToy(it)
-    db.toys = db.toys or {}
-    if KNOWN_TOYS[it.id] then
-        say("Предмет уже є у каталозі іграшок.")
-    else
-        db.toys[it.id] = not db.toys[it.id] or nil
-        say((db.toys[it.id] and "Іграшка: " or "Знято позначку: ") .. it.link)
-    end
-    repaint()
 end
 
 local function jumpToSpace(targetID)
@@ -712,6 +720,7 @@ local function makeCell(parent)
         b.countText = b:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
         b.countText:SetPoint("BOTTOMRIGHT", -4, 2)
     end
+    b.questTexture = _G[name .. "IconQuestTexture"]
     b.cooldown = _G[name .. "Cooldown"] or CreateFrame("Cooldown", nil, b, "CooldownFrameTemplate")
     b.cooldown:SetAllPoints(b)
     b.cooldown:Hide()
@@ -720,20 +729,18 @@ local function makeCell(parent)
         if spacesFocus then spacesFocus() end
         local it = self.item
         local entry = self.entry
-        if it and not it.equipped and MerchantFrame and MerchantFrame:IsShown() and
-            MerchantFrame.selectedTab == 1 and ShowContainerSellCursor then
-            ShowContainerSellCursor(it.bag, it.slot)
-        end
-        if not it then return end
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        if it then
-            if it.equipped then
-                GameTooltip:SetInventoryItem("player", it.slot)
-            else
-                GameTooltip:SetBagItem(it.bag, it.slot)
-            end
+        if it and not it.equipped and ContainerFrameItemButton_OnEnter then
+            -- Same tooltip as a Blizzard bag: compare, repair cost, sell cursor.
+            ContainerFrameItemButton_OnEnter(self)
+        elseif it then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetInventoryItem("player", it.slot)
         elseif entry and entry.link then
+            -- Reserved item that is no longer in the bags (search results).
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:SetHyperlink(entry.link)
+        else
+            return
         end
         if self.role == "search" then
             local target = self.searchTargetID == 0 and "Загальні" or
@@ -747,7 +754,6 @@ local function makeCell(parent)
         elseif self.role == "bottom" and it then
             GameTooltip:AddLine("ЛКМ: додати до вибраного простору", 0.6, 0.8, 1)
             GameTooltip:AddLine("Перетягни у потрібну клітинку зверху", 0.6, 0.8, 1)
-            GameTooltip:AddLine("Alt + ПКМ: додати / прибрати із каталогу іграшок", 0.6, 0.8, 1)
         end
         GameTooltip:Show()
     end)
@@ -776,14 +782,10 @@ local function makeCell(parent)
         end
         local it = self.item
         if button == "RightButton" then
-            if IsAltKeyDown() and not IsShiftKeyDown() and not IsControlKeyDown() then
-                if self.role == "space" then
-                    unpinAt(self.space, self.pos)
-                elseif it then
-                    toggleToy(it)
-                end
-            elseif it and it.equipped and not anyModifier() then
-                if UseInventoryItem then UseInventoryItem(it.slot) end
+            -- Equipped items are only a preview of where they go after unequip.
+            if IsAltKeyDown() and not IsShiftKeyDown() and not IsControlKeyDown() and
+                self.role == "space" then
+                unpinAt(self.space, self.pos)
             end
             -- Ordinary bag right clicks are handled only by the template.
             return
@@ -889,6 +891,23 @@ local function setCell(b, info)
     if loc and loc.bag and loc.slot then
         local _, _, _, _, readable = GetContainerItemInfo(loc.bag, loc.slot)
         b.readable = readable
+    end
+    -- Native quest marker: "!" starts a quest, border = quest item.
+    local quest = b.questTexture
+    if quest then
+        local isQuest, questID, isActive
+        if it and not it.equipped and it.bag and GetContainerItemQuestInfo then
+            isQuest, questID, isActive = GetContainerItemQuestInfo(it.bag, it.slot)
+        end
+        if questID and not isActive then
+            quest:SetTexture(TEXTURE_ITEM_QUEST_BANG or "Interface\\ContainerFrame\\UI-Icon-QuestBang")
+            quest:Show()
+        elseif questID or isQuest then
+            quest:SetTexture(TEXTURE_ITEM_QUEST_BORDER or "Interface\\ContainerFrame\\UI-Icon-QuestBorder")
+            quest:Show()
+        else
+            quest:Hide()
+        end
     end
 end
 
@@ -1373,12 +1392,8 @@ local function setupUI()
     f.bagTop:SetTexCoord(0, 1, 0.00390625, 0.18359375)
     f.bagMiddle1 = bagTexture()
     f.bagMiddle2 = bagTexture()
-    f.bagBottom = bagTexture()
     f.bagMiddle1:SetWidth(192)
     f.bagMiddle2:SetWidth(192)
-    f.bagBottom:SetWidth(192)
-    f.bagBottom:SetHeight(10)
-    f.bagBottom:SetTexCoord(0.25, 1, 0.330078125, 0.349609375)
 
     -- Preserve the backpack's native money strip below the variable bag body.
     f.moneyBackground = f:CreateTexture(nil, "BACKGROUND")
@@ -1447,7 +1462,11 @@ local function setupUI()
         end
         db.replaceBags = self:GetChecked() and true or false
         if applyBagBindings then applyBagBindings() end
-        if db.replaceBags and CloseAllBags then CloseAllBags() end
+        if db.replaceBags and CloseAllBags then
+            ownBagCall = true
+            CloseAllBags()
+            ownBagCall = false
+        end
         f:Update()
     end)
 
@@ -1685,7 +1704,6 @@ local function setupUI()
         end
         -- The backpack's own bottom (slot padding + money groove) continues the
         -- body directly, like the stock backpack; no second border cap.
-        f.bagBottom:Hide()
         f.moneyBackground:ClearAllPoints()
         f.moneyBackground:SetPoint("TOPRIGHT", previous, "BOTTOMRIGHT", 0, 0)
         f.moneyBackground:Show()
@@ -1922,7 +1940,6 @@ local function setupUI()
     function f:Update(force)
         if not force and not self:IsShown() then return end
         local state = scan()
-        currentState = state
         local sp = getActive()
         -- Detect a gear swap without changing SavedVariables. When a reserved
         -- gear item is equipped, show the just-unequipped gear in its cell as
@@ -2095,6 +2112,8 @@ local function setupUI()
     f:SetScript("OnHide", function(self)
         finishResize()
         self.tempSwaps = {}
+        -- Gear swaps made while closed are not "just unequipped" any more.
+        self.previousEquipped = nil
         if ruleDialog then ruleDialog:Hide() end
         hideShades()
     end)
@@ -2113,7 +2132,7 @@ applyBagBindings = function()
     if InCombatLockdown and InCombatLockdown() then return end
     if ClearOverrideBindings then ClearOverrideBindings(bindingOwner) end
     if not db or not SetOverrideBindingClick then return end
-    local commands = {"AMDIRSPACES_TOGGLE", "SIMPLESPACES_TOGGLE"}
+    local commands = {"AMDIRSPACES_TOGGLE"}
     if db.replaceBags then
         for _, command in ipairs({"TOGGLEBACKPACK", "OPENALLBAGS", "TOGGLEBAG1", "TOGGLEBAG2", "TOGGLEBAG3", "TOGGLEBAG4"}) do
             commands[#commands + 1] = command
@@ -2152,6 +2171,7 @@ function AmdirSpaces_Toggle(allBags)
             end
         end
     end
+    ownBagCall = true
     if close then
         ui:Hide()
         if db and db.replaceBags and CloseAllBags then CloseAllBags() end
@@ -2164,6 +2184,43 @@ function AmdirSpaces_Toggle(allBags)
         end
         ui:Show()
     end
+    ownBagCall = false
+end
+
+-- Replacement mode for every other way the game opens/closes the inventory
+-- (backpack button, bag slot buttons, mailbox, AH, trade, guild bank, vendor,
+-- bank, other addons). Post-hooks only: Blizzard code is never replaced.
+local function replacing()
+    return db and db.replaceBags and ui and not ownBagCall
+end
+
+local function inventoryBagOpen()
+    for bag = 0, (NUM_BAG_SLOTS or 4) do
+        if IsBagOpen(bag) then return true end
+    end
+end
+
+local function hookBagFunctions()
+    if not hooksecurefunc then return end
+    local function toggled()
+        if not replacing() then return end
+        local wasShown = ui:IsShown()
+        ownBagCall = true
+        closeInventoryBags()
+        if wasShown then ui:Hide() else ui:Show() end
+        ownBagCall = false
+    end
+    if ToggleBackpack then hooksecurefunc("ToggleBackpack", toggled) end
+    if ToggleBag then
+        hooksecurefunc("ToggleBag", function(bag)
+            if bag and bag >= 1 and bag <= (NUM_BAG_SLOTS or 4) then toggled() end
+        end)
+    end
+    local function closed()
+        if replacing() then ui:Hide() end
+    end
+    if CloseAllBags then hooksecurefunc("CloseAllBags", closed) end
+    if CloseBackpack then hooksecurefunc("CloseBackpack", closed) end
 end
 
 SLASH_AMDIRSPACES1 = "/as"
@@ -2184,8 +2241,6 @@ dispatcher:RegisterEvent("UPDATE_BINDINGS")
 dispatcher:RegisterEvent("PLAYER_MONEY")
 dispatcher:RegisterEvent("MERCHANT_SHOW")
 dispatcher:RegisterEvent("MERCHANT_CLOSED")
-dispatcher:RegisterEvent("BANKFRAME_OPENED")
-dispatcher:RegisterEvent("BANKFRAME_CLOSED")
 dispatcher:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == ADDON then
         if type(AmdirSpacesDB) ~= "table" then
@@ -2195,7 +2250,7 @@ dispatcher:SetScript("OnEvent", function(self, event, arg1)
         SimpleSpacesDB = nil -- imported legacy SavedVariables, if supplied
         if type(db.spaces) ~= "table" then db.spaces = {} end
         if type(db.nextID) ~= "number" then db.nextID = 1 end
-        if type(db.toys) ~= "table" then db.toys = {} end
+        db.toys = nil -- removed feature
         db.replaceBags = db.replaceBags and true or false
         db.hideBottom = db.hideBottom and true or false
         db.compactMode = db.compactMode and true or false
@@ -2215,6 +2270,9 @@ dispatcher:SetScript("OnEvent", function(self, event, arg1)
         db.compactHeight = 256 + (compactRows - 4) * 41
         for _, sp in ipairs(db.spaces) do
             sp.slots = type(sp.slots) == "table" and sp.slots or {}
+            for _, pinned in pairs(sp.slots) do
+                if type(pinned) == "table" then pinned.pendingUntil = nil end
+            end
             local individualRules = {}
             if type(sp.rules) == "table" then
                 for id, enabled in pairs(sp.rules) do
@@ -2231,11 +2289,10 @@ dispatcher:SetScript("OnEvent", function(self, event, arg1)
         db.uiVersion = 5
         setupClasses()
         migrateRuleFilters()
-        ruleRetryUntil = GetTime() + 3
-        routeIncomingItems()
+        primeRuleCounts()
         setupUI()
-        ui:Update(true)
         hookNativeBags()
+        hookBagFunctions()
         applyBagBindings()
         if hooksecurefunc and ContainerFrame_Update then
             hooksecurefunc("ContainerFrame_Update", function()
@@ -2265,14 +2322,7 @@ dispatcher:SetScript("OnEvent", function(self, event, arg1)
         if applyBagBindings then applyBagBindings() end
     elseif event == "UPDATE_BINDINGS" then
         if applyBagBindings then applyBagBindings() end
-    elseif event == "BANKFRAME_OPENED" then
-        if db and db.replaceBags then self.openBankBags = true end
-    elseif event == "BANKFRAME_CLOSED" then
-        self.openBankBags = nil
     elseif event == "MERCHANT_SHOW" or event == "MERCHANT_CLOSED" then
-        if event == "MERCHANT_SHOW" and db and db.replaceBags then
-            self.openMerchantBags = true
-        end
         if ui and ui:IsShown() then ui:Update() end
     elseif event == "PLAYER_MONEY" then
         if ui and ui.money and MoneyFrame_Update and GetMoney then
@@ -2287,6 +2337,12 @@ dispatcher:SetScript("OnEvent", function(self, event, arg1)
         -- Fast refresh: the source slot greys out as soon as the item is picked up.
         pendingRefresh = true
         nextRefresh = GetTime() + 0.02
+    elseif ui and event == "PLAYER_ENTERING_WORLD" and not self.primed then
+        self.primed = true
+        pendingRuleRoute = false
+        primeRuleCounts()
+        pendingRefresh = true
+        nextRefresh = GetTime() + 0.12
     elseif ui and (event == "BAG_UPDATE" or
         event == "PLAYER_ENTERING_WORLD" or
         (event == "UNIT_INVENTORY_CHANGED" and arg1 == "player")) then
@@ -2298,22 +2354,13 @@ dispatcher:SetScript("OnEvent", function(self, event, arg1)
     end
 end)
 dispatcher:SetScript("OnUpdate", function(self, elapsed)
-    if self.openBankBags then
-        self.openBankBags = nil
-        -- Run after Blizzard's bank event handler has opened native bags.
-        if db and db.replaceBags and BankFrame and BankFrame:IsShown() and ui then
-            closeInventoryBags()
-            ui:Show()
-            ui:Update()
-        end
-    end
-    if self.openMerchantBags then
-        self.openMerchantBags = nil
-        if db and db.replaceBags and MerchantFrame and MerchantFrame:IsShown() and ui then
-            if CloseAllBags then CloseAllBags() end
-            ui:Show()
-            ui:Update()
-        end
+    -- Whatever opened a Blizzard inventory bag, show AmdirSpaces instead.
+    -- Bank bags (5-11) stay as they are.
+    if replacing() and inventoryBagOpen() then
+        ownBagCall = true
+        closeInventoryBags()
+        ui:Show()
+        ownBagCall = false
     end
     if cursorSrc and not (CursorHasItem and CursorHasItem()) then cursorSrc = nil end
     -- Blizzard frequently recreates bag buttons/visibility without firing
@@ -2329,7 +2376,7 @@ dispatcher:SetScript("OnUpdate", function(self, elapsed)
             end
         end
     end
-    if pendingRuleRoute and GetTime() >= nextRuleRoute and
+    if pendingRuleRoute and self.primed and GetTime() >= nextRuleRoute and
         not (CursorHasItem and CursorHasItem()) then
         pendingRuleRoute = false
         routeIncomingItems()
@@ -2338,7 +2385,7 @@ dispatcher:SetScript("OnUpdate", function(self, elapsed)
     end
     if pendingRefresh and GetTime() >= nextRefresh then
         pendingRefresh = false
-        if ui then ui:Update(true)
-        elseif refreshNativeBags then refreshNativeBags(scan()) end
+        if ui and ui:IsShown() then ui:Update()
+        elseif refreshNativeBags then refreshNativeBags() end
     end
 end)
