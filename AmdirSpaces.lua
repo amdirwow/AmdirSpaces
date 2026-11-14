@@ -2106,7 +2106,9 @@ end
 -- temporarily click our button. No account key bindings are overwritten.
 local bindingOwner = CreateFrame("Frame", "AmdirSpacesBindingOwner", UIParent)
 local bindingButton = CreateFrame("Button", "AmdirSpacesBagToggleButton", UIParent)
-bindingButton:SetScript("OnClick", function() AmdirSpaces_Toggle() end)
+bindingButton:SetScript("OnClick", function(_, command)
+    AmdirSpaces_Toggle(command == "OPENALLBAGS")
+end)
 applyBagBindings = function()
     if InCombatLockdown and InCombatLockdown() then return end
     if ClearOverrideBindings then ClearOverrideBindings(bindingOwner) end
@@ -2121,23 +2123,44 @@ applyBagBindings = function()
     for _, command in ipairs(commands) do
         local key1, key2 = GetBindingKey(command)
         if key1 and not assigned[key1] then
-            SetOverrideBindingClick(bindingOwner, true, key1, "AmdirSpacesBagToggleButton", "LeftButton")
+            SetOverrideBindingClick(bindingOwner, true, key1, "AmdirSpacesBagToggleButton", command)
             assigned[key1] = true
         end
         if key2 and not assigned[key2] then
-            SetOverrideBindingClick(bindingOwner, true, key2, "AmdirSpacesBagToggleButton", "LeftButton")
+            SetOverrideBindingClick(bindingOwner, true, key2, "AmdirSpacesBagToggleButton", command)
             assigned[key2] = true
         end
     end
 end
 
-function AmdirSpaces_Toggle()
+local function closeInventoryBags()
+    -- Keep bank bags intact when replacing only the player's inventory.
+    for bag = 0, (NUM_BAG_SLOTS or 4) do CloseBag(bag) end
+end
+
+function AmdirSpaces_Toggle(allBags)
     if not ui then return end
-    if ui:IsShown() then
+    local atBank = db and db.replaceBags and BankFrame and BankFrame:IsShown()
+    local close = ui:IsShown()
+    if allBags == true and atBank and close then
+        -- Like ToggleAllBags: first open any missing bank bags; close only
+        -- when the inventory and every equipped bank bag are already open.
+        for bag = (NUM_BAG_SLOTS or 4) + 1, (NUM_BAG_SLOTS or 4) + (NUM_BANKBAGSLOTS or 7) do
+            if GetContainerNumSlots(bag) > 0 and not IsBagOpen(bag) then
+                close = false
+                break
+            end
+        end
+    end
+    if close then
         ui:Hide()
+        if db and db.replaceBags and CloseAllBags then CloseAllBags() end
     else
-        if db and db.replaceBags and CloseAllBags then
-            CloseAllBags()
+        if db and db.replaceBags then closeInventoryBags() end
+        if allBags == true and atBank then
+            for bag = (NUM_BAG_SLOTS or 4) + 1, (NUM_BAG_SLOTS or 4) + (NUM_BANKBAGSLOTS or 7) do
+                OpenBag(bag)
+            end
         end
         ui:Show()
     end
@@ -2161,6 +2184,8 @@ dispatcher:RegisterEvent("UPDATE_BINDINGS")
 dispatcher:RegisterEvent("PLAYER_MONEY")
 dispatcher:RegisterEvent("MERCHANT_SHOW")
 dispatcher:RegisterEvent("MERCHANT_CLOSED")
+dispatcher:RegisterEvent("BANKFRAME_OPENED")
+dispatcher:RegisterEvent("BANKFRAME_CLOSED")
 dispatcher:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == ADDON then
         if type(AmdirSpacesDB) ~= "table" then
@@ -2240,6 +2265,10 @@ dispatcher:SetScript("OnEvent", function(self, event, arg1)
         if applyBagBindings then applyBagBindings() end
     elseif event == "UPDATE_BINDINGS" then
         if applyBagBindings then applyBagBindings() end
+    elseif event == "BANKFRAME_OPENED" then
+        if db and db.replaceBags then self.openBankBags = true end
+    elseif event == "BANKFRAME_CLOSED" then
+        self.openBankBags = nil
     elseif event == "MERCHANT_SHOW" or event == "MERCHANT_CLOSED" then
         if event == "MERCHANT_SHOW" and db and db.replaceBags then
             self.openMerchantBags = true
@@ -2269,6 +2298,15 @@ dispatcher:SetScript("OnEvent", function(self, event, arg1)
     end
 end)
 dispatcher:SetScript("OnUpdate", function(self, elapsed)
+    if self.openBankBags then
+        self.openBankBags = nil
+        -- Run after Blizzard's bank event handler has opened native bags.
+        if db and db.replaceBags and BankFrame and BankFrame:IsShown() and ui then
+            closeInventoryBags()
+            ui:Show()
+            ui:Update()
+        end
+    end
     if self.openMerchantBags then
         self.openMerchantBags = nil
         if db and db.replaceBags and MerchantFrame and MerchantFrame:IsShown() and ui then
