@@ -18,6 +18,7 @@ local pendingRefresh = false
 local nextRefresh = 0
 local pendingRuleRoute = false
 local ownBagCall = false -- true while AmdirSpaces itself opens/closes Blizzard bags
+local pendingHide = false -- a toggle-close deferred to the next frame (see hookBagFunctions)
 local nextRuleRoute = 0
 local ruleRetryUntil = 0
 local ruleBagCounts = {}
@@ -2160,7 +2161,8 @@ end
 function AmdirSpaces_Toggle(allBags)
     if not ui then return end
     local atBank = db and db.replaceBags and BankFrame and BankFrame:IsShown()
-    local close = ui:IsShown()
+    local close = ui:IsShown() and not pendingHide
+    pendingHide = false
     if allBags == true and atBank and close then
         -- Like ToggleAllBags: first open any missing bank bags; close only
         -- when the inventory and every equipped bank bag are already open.
@@ -2200,15 +2202,44 @@ local function inventoryBagOpen()
     end
 end
 
+-- Blizzard "open" calls (vendor, mailbox, AH: OpenAllBags(true),
+-- OpenBackpack, OpenBag) internally toggle every bag one by one, so the
+-- number of ToggleBackpack/ToggleBag calls decides whether we end up shown.
+-- A hide requested by a toggle is therefore deferred to the next frame and
+-- cancelled when the surrounding call turns out to be an "open" request.
 local function hookBagFunctions()
     if not hooksecurefunc then return end
     local function toggled()
         if not replacing() then return end
-        local wasShown = ui:IsShown()
+        local wasShown = ui:IsShown() and not pendingHide
         ownBagCall = true
         closeInventoryBags()
-        if wasShown then ui:Hide() else ui:Show() end
+        if wasShown then
+            pendingHide = true
+        else
+            pendingHide = false
+            ui:Show()
+        end
         ownBagCall = false
+    end
+    local function opened()
+        if not replacing() then return end
+        pendingHide = false
+        ownBagCall = true
+        closeInventoryBags()
+        ui:Show()
+        ownBagCall = false
+    end
+    if OpenAllBags then
+        hooksecurefunc("OpenAllBags", function(forceOpen)
+            if forceOpen then opened() end
+        end)
+    end
+    if OpenBackpack then hooksecurefunc("OpenBackpack", opened) end
+    if OpenBag then
+        hooksecurefunc("OpenBag", function(bag)
+            if bag and bag >= 0 and bag <= (NUM_BAG_SLOTS or 4) then opened() end
+        end)
     end
     if ToggleBackpack then hooksecurefunc("ToggleBackpack", toggled) end
     if ToggleBag then
@@ -2217,7 +2248,10 @@ local function hookBagFunctions()
         end)
     end
     local function closed()
-        if replacing() then ui:Hide() end
+        if replacing() then
+            pendingHide = false
+            ui:Hide()
+        end
     end
     if CloseAllBags then hooksecurefunc("CloseAllBags", closed) end
     if CloseBackpack then hooksecurefunc("CloseBackpack", closed) end
@@ -2354,6 +2388,10 @@ dispatcher:SetScript("OnEvent", function(self, event, arg1)
     end
 end)
 dispatcher:SetScript("OnUpdate", function(self, elapsed)
+    if pendingHide then
+        pendingHide = false
+        if ui then ui:Hide() end
+    end
     -- Whatever opened a Blizzard inventory bag, show AmdirSpaces instead.
     -- Bank bags (5-11) stay as they are.
     if replacing() and inventoryBagOpen() then
