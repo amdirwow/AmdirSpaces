@@ -120,51 +120,60 @@ local function scan()
             end
         end
     end
-    -- Match reserved slots in two passes. Exact link first, itemID fallback
-    -- (for example, when a player enchants an already assigned item).
+    -- Match reserved cells to real items, most exact first:
+    --   1. the bag slot this cell last saw AND the same link (identical stacks,
+    --      two copies of one item with different enchants/gems);
+    --   2. the same link anywhere (item moved, equipped or unequipped);
+    --   3. the bag slot it last saw with the same itemID (item got enchanted);
+    --   4. the same itemID anywhere.
     -- Equipped items have priority, so their reserved virtual slots look empty.
     for _, sp in ipairs(db.spaces) do
         state.assignments[sp.id] = {}
     end
-    -- Pass 0: the exact bag slot this cell last saw (tells identical stacks apart).
     local byLoc = {}
     for _, it in ipairs(state.bags) do byLoc[it.bag .. ":" .. it.slot] = it end
+    -- A cell waiting for an item that is still travelling to its bag slot
+    -- (split stack, bank) only accepts that slot, never another copy.
+    local now = GetTime()
     for _, sp in ipairs(db.spaces) do
-        for pos, pinned in ipairs(allSlots(sp)) do
-            if pinned and pinned.bag and pinned.slot then
-                local it = byLoc[pinned.bag .. ":" .. pinned.slot]
-                if it and not state.used[it] and it.id == pinned.id then
-                    state.used[it] = true
-                    state.assignments[sp.id][pos] = it
-                    pinned.pendingUntil = nil
-                end
+        for _, pinned in ipairs(allSlots(sp)) do
+            if pinned and pinned.pendingUntil and now >= pinned.pendingUntil then
+                pinned.pendingUntil = nil
             end
         end
     end
-    -- A cell waiting for an item that is still travelling to its bag slot
-    -- (split stack, bank) must not grab another copy by itemID meanwhile.
-    local now = GetTime()
-    for pass = 1, 2 do
+    local function assign(sp, pos, pinned, it)
+        state.used[it] = true
+        state.assignments[sp.id][pos] = it
+        pinned.pendingUntil = nil
+    end
+    for pass = 1, 4 do
+        local byLocation = pass == 1 or pass == 3
+        local exactKey = pass <= 2
         for _, sp in ipairs(db.spaces) do
             for pos, pinned in ipairs(allSlots(sp)) do
-                if pinned and pinned.pendingUntil and now >= pinned.pendingUntil then
-                    pinned.pendingUntil = nil
-                end
-                if pinned and not pinned.pendingUntil and not state.assignments[sp.id][pos] then
-                    local candidate
-                    for _, pool in ipairs({state.equipped, state.bags}) do
-                        for _, it in ipairs(pool) do
-                            if not state.used[it] and it.id == pinned.id and
-                                ((pass == 1 and it.key == pinned.key) or pass == 2) then
-                                candidate = it
-                                break
-                            end
+                if pinned and not state.assignments[sp.id][pos] then
+                    if byLocation then
+                        local it = pinned.bag and pinned.slot and byLoc[pinned.bag .. ":" .. pinned.slot]
+                        if it and not state.used[it] and it.id == pinned.id and
+                            (not exactKey or it.key == pinned.key) then
+                            assign(sp, pos, pinned, it)
+                            -- Same physical item, new enchant/gems: remember them.
+                            if not exactKey then pinned.key, pinned.link = it.key, it.link end
                         end
-                        if candidate then break end
-                    end
-                    if candidate then
-                        state.used[candidate] = true
-                        state.assignments[sp.id][pos] = candidate
+                    elseif not pinned.pendingUntil then
+                        local candidate
+                        for _, pool in ipairs({state.equipped, state.bags}) do
+                            for _, it in ipairs(pool) do
+                                if not state.used[it] and it.id == pinned.id and
+                                    (not exactKey or it.key == pinned.key) then
+                                    candidate = it
+                                    break
+                                end
+                            end
+                            if candidate then break end
+                        end
+                        if candidate then assign(sp, pos, pinned, candidate) end
                     end
                 end
             end
@@ -2044,7 +2053,9 @@ local function setupUI()
                 local proxy, temporary
                 local swap = self.tempSwaps[i]
                 if swap and pinned and pinned.equipped and pinned.id == swap.newID then
-                    for _, bagItem in ipairs(state.bags) do
+                    -- Only a stand-in for gear that has no cell of its own;
+                    -- otherwise it would be shown twice.
+                    for _, bagItem in ipairs(state.general) do
                         if bagItem.id == swap.oldID and
                             (bagItem.key == swap.oldKey or not swap.oldKey) then
                             proxy, temporary = bagItem, true
